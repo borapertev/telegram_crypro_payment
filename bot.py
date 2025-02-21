@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, JobQueue
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, JobQueue, MessageHandler, filters
 from payment_processor import NowPaymentsProcessor
 import html
 import sqlite3
@@ -53,16 +53,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ödeme başlatma komutu"""
     keyboard = [
-        [InlineKeyboardButton("💳 Ödeme Bilgilerini Al", callback_data='get_payment_info')]
+        [InlineKeyboardButton("💳 Kripto ile Öde", callback_data='crypto_payment')],
+        [InlineKeyboardButton("🏦 IBAN ile Öde", callback_data='bank_payment')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "💰 Bitcoin (BTC) ile Ödeme\n\n"
-        f"💵 Ödeme Tutarı: ${os.getenv('MINIMUM_PAYMENT_USD')} USD\n"
-        "⏱ Süre: 20 dakika\n"
-        "🔗 Ağ: Bitcoin Network\n\n"
-        "📝 Ödeme bilgilerini almak için aşağıdaki butona tıklayın:",
+        "💰 Ödeme Yöntemi Seçin:\n\n"
+        "1. Kripto Para (Anında Onay)\n"
+        "2. Banka Havalesi (Manuel Onay)\n\n"
+        "ℹ️ IBAN ile ödemede onay 24 saate kadar sürebilir.",
         reply_markup=reply_markup
     )
 
@@ -72,6 +72,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     
     if query.data == 'payment':
+        keyboard = [
+            [InlineKeyboardButton("💳 Kripto ile Öde", callback_data='crypto_payment')],
+            [InlineKeyboardButton("🏦 IBAN ile Öde", callback_data='bank_payment')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.reply_text(
+            "💰 Ödeme Yöntemi Seçin:\n\n"
+            "1. Kripto Para (Anında Onay)\n"
+            "2. Banka Havalesi (Manuel Onay)\n\n"
+            "ℹ️ IBAN ile ödemede onay 24 saate kadar sürebilir.",
+            reply_markup=reply_markup
+        )
+    
+    elif query.data == 'crypto_payment':
         keyboard = [
             [InlineKeyboardButton("💳 Ödeme Bilgilerini Al", callback_data='get_payment_info')]
         ]
@@ -86,40 +101,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=reply_markup
         )
     
-    elif query.data == 'get_payment_info':
-        try:
-            amount = float(os.getenv('MINIMUM_PAYMENT_USD'))
-            result = await payment_processor.create_payment(amount)
-            
-            if result['success']:
-                context.user_data['payment_id'] = result['payment_id']
-                message = (
-                    f"🔹 Ödeme Bilgileri:\n\n"
-                    f"💵 Tutar: ${result['amount_usd']} USD\n"
-                    f"₿ BTC Miktarı: {result['amount_btc']} BTC\n"
-                    f"📝 Ödeme ID: `{result['payment_id']}`\n"
-                    f"🏦 Bitcoin Cüzdan Adresi:\n`{result['wallet_address']}`\n\n"
-                    f"❗️ Önemli Notlar:\n"
-                    f"• Tam olarak {result['amount_btc']} BTC gönderiniz\n"
-                    f"• Bitcoin ağını kullanın\n"
-                    f"• Ödeme ID'nizi saklayın\n"
-                    f"• Ödeme sonrası /check_payment komutunu kullanın"
-                )
-                
-                await query.message.reply_text(
-                    text=message,
-                    parse_mode='Markdown'
-                )
-            else:
-                await query.message.reply_text(
-                    "❌ Ödeme bilgileri oluşturulurken bir hata oluştu.\n"
-                    f"Hata: {result.get('error', 'Bilinmeyen hata')}"
-                )
-        except Exception as e:
-            logging.error(f"Ödeme oluşturma hatası: {str(e)}")
-            await query.message.reply_text(
-                "❌ Bir hata oluştu. Lütfen daha sonra tekrar deneyin."
-            )
+    elif query.data == 'bank_payment':
+        user_id = update.effective_user.id
+        await query.message.reply_text(
+            "🏦 Banka Havalesi Bilgileri\n\n"
+            f"Banka: {os.getenv('BANK_NAME')}\n"
+            f"IBAN: {os.getenv('BANK_IBAN')}\n"
+            f"Alıcı: {os.getenv('BANK_HOLDER')}\n\n"
+            f"💰 Tutar: ${os.getenv('MINIMUM_PAYMENT_USD')} USD (XXX TL)\n\n"
+            "⚠️ Önemli Notlar:\n"
+            f"1. Açıklama kısmına şunu yazın: VIP {user_id}\n"
+            "2. Ödeme yaptıktan sonra dekontu buraya gönderin\n"
+            "3. Onay sonrası gruba ekleneceksiniz\n\n",
+            parse_mode='HTML'
+        )
+        # Kullanıcıyı dekont gönderme moduna al
+        context.user_data['waiting_for_receipt'] = True
 
 async def check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
@@ -426,6 +423,113 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     finally:
         conn.close()
 
+async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin için manuel ödeme onaylama komutu"""
+    try:
+        # Admin kontrolü
+        if str(update.effective_user.id) != os.getenv('ADMIN_ID'):
+            await update.message.reply_text("Bu komut sadece yöneticiler içindir.")
+            return
+        
+        args = context.args
+        if len(args) != 1:
+            await update.message.reply_text(
+                "❌ Kullanıcı ID'si gerekli.\n"
+                "Örnek: /approve_payment 123456789"
+            )
+            return
+        
+        user_id = int(args[0])
+        
+        # Kullanıcıyı veritabanına ekle
+        add_member(user_id)
+        
+        # Kullanıcıya bildirim gönder
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "✅ Ödemeniz onaylandı!\n\n"
+                    "Gruba katılmak için aşağıdaki bağlantıyı kullanın:\n"
+                    f"{os.getenv('TELEGRAM_GROUP_INVITE_LINK')}\n\n"
+                    "⚠️ Üyeliğiniz 30 gün boyunca aktif kalacaktır.\n"
+                    "📅 Süre sonunda otomatik olarak gruptan çıkarılacaksınız."
+                )
+            )
+            await update.message.reply_text(f"✅ Kullanıcı {user_id} başarıyla onaylandı.")
+            
+        except Exception as e:
+            logging.error(f"Onay bildirimi hatası: {str(e)}")
+            await update.message.reply_text(
+                f"⚠️ Kullanıcı eklendi ama bildirim gönderilemedi: {user_id}"
+            )
+            
+    except Exception as e:
+        logging.error(f"Ödeme onaylama hatası: {str(e)}")
+        await update.message.reply_text("❌ Onaylama sırasında bir hata oluştu.")
+
+async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dekont işleme"""
+    if not context.user_data.get('waiting_for_receipt'):
+        return
+    
+    user_id = update.effective_user.id
+    
+    # Dekont fotoğraf mı dosya mı kontrol et
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document:
+        file_id = update.message.document.file_id
+    else:
+        await update.message.reply_text(
+            "❌ Lütfen dekontu fotoğraf veya dosya olarak gönderin."
+        )
+        return
+    
+    # Admin'e bildirim gönder
+    admin_id = os.getenv('ADMIN_ID')
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=(
+                "💳 Yeni Ödeme Dekontu\n\n"
+                f"👤 Kullanıcı ID: {user_id}\n"
+                f"📅 Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                "Onaylamak için:\n"
+                f"/approve_payment {user_id}"
+            )
+        )
+        # Dekontu forward et
+        if update.message.photo:
+            await context.bot.send_photo(
+                chat_id=admin_id,
+                photo=file_id,
+                caption=f"Dekont - Kullanıcı ID: {user_id}"
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=admin_id,
+                document=file_id,
+                caption=f"Dekont - Kullanıcı ID: {user_id}"
+            )
+        
+        # Kullanıcıya bilgi ver
+        await update.message.reply_text(
+            "✅ Dekont alındı!\n\n"
+            "Ödemeniz kontrol edildikten sonra gruba ekleneceksiniz.\n"
+            "Bu işlem en fazla 24 saat sürebilir."
+        )
+        
+        # Dekont bekleme modunu kapat
+        context.user_data['waiting_for_receipt'] = False
+        
+    except Exception as e:
+        logging.error(f"Dekont işleme hatası: {str(e)}")
+        await update.message.reply_text(
+            "❌ Dekont gönderilirken bir hata oluştu.\n"
+            "Lütfen daha sonra tekrar deneyin."
+        )
+
 def main() -> None:
     """Bot başlatma fonksiyonu"""
     # Daha uzun timeout değerleri ile application oluştur
@@ -446,6 +550,8 @@ def main() -> None:
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(button_callback, pattern='^payment$'))
+    application.add_handler(CallbackQueryHandler(button_callback, pattern='^crypto_payment$'))
+    application.add_handler(CallbackQueryHandler(button_callback, pattern='^bank_payment$'))
     application.add_handler(CallbackQueryHandler(create_payment, pattern='^get_payment_info$'))
     application.add_handler(CallbackQueryHandler(check_payment, pattern='^check_[0-9]+$'))
     application.add_handler(CallbackQueryHandler(test_check_callback, pattern='^test_check$'))
@@ -458,6 +564,15 @@ def main() -> None:
     
     # Üyelik kontrolü için komut ekle
     application.add_handler(CommandHandler("check_expired", check_expired_members))
+    
+    # Üyelik onaylama için komut ekle
+    application.add_handler(CommandHandler("approve_payment", approve_payment))
+    
+    # Dekont handler
+    application.add_handler(MessageHandler(
+        filters.PHOTO | filters.Document.ALL,
+        handle_receipt
+    ))
     
     # Veritabanını başlat
     init_db()
